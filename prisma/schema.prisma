@@ -1,0 +1,377 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "mysql"
+}
+
+model User {
+  id           String       @id @default(uuid())
+  name         String
+  /// Employee number (EMP-####). Proof the account belongs to a real employee.
+  employeeId   String       @unique
+  username     String       @unique
+  password     String
+  role         Role         @default(CASHIER)
+  status       UserStatus   @default(ACTIVE)
+  lastActive   DateTime     @default(now())
+  createdAt    DateTime     @default(now())
+  updatedAt    DateTime     @updatedAt
+
+  transactions     Transaction[]
+  inventoryUpdates InventoryItem[]
+  stockPurchases   StockPurchase[]
+  importLogs       ImportLog[]
+  stockMovements   StockMovement[]
+  activity         ActivityLog[]
+}
+
+enum Role {
+  ADMIN
+  OWNER
+  SUPERVISOR
+  CASHIER
+  KITCHEN
+}
+
+enum UserStatus {
+  ACTIVE
+  ARCHIVED
+}
+
+model MenuCategory {
+  id        String     @id @default(uuid())
+  name      String     @unique
+  sortOrder Int        @default(0)
+  /// Archiving a category takes it (and its items) off the menu without deleting
+  /// history. Same nullable-timestamp pattern as InventoryItem.archivedAt.
+  archivedAt DateTime?
+  /// Finished goods — bread, donuts, bottled drinks — are counted by hand rather
+  /// than made from tracked ingredients. This only sets the DEFAULT for new items
+  /// in the category; MenuItem.stockMode is the truth, so a single dish inside a
+  /// counted category can still be recipe-based and vice versa.
+  tracksStockDirectly Boolean @default(false)
+  createdAt DateTime   @default(now())
+
+  items MenuItem[]
+}
+
+model MenuItem {
+  id            String       @id @default(uuid())
+  name          String
+  description   String?
+  categoryId    String
+  category      MenuCategory @relation(fields: [categoryId], references: [id])
+  price         Float
+  originalPrice Float?
+  isPromo       Boolean      @default(false)
+  isRecommended Boolean      @default(false)
+  status        ItemStatus   @default(AVAILABLE)
+  /// How this item's availability is worked out. RECIPE derives it from
+  /// ingredient stock through RecipeItem; DIRECT reads stockQuantity below.
+  /// Defaults from MenuCategory.tracksStockDirectly but is set per item.
+  stockMode     StockMode    @default(RECIPE)
+  /// The hand-counted stock, and the only thing that gates a DIRECT item. Read
+  /// and written only when stockMode is DIRECT — for a RECIPE item this column
+  /// is ignored and its value is meaningless leftover.
+  stockQuantity Int          @default(0)
+  /// At or below this the item reads Low; zero always reads Out of Stock. Same
+  /// rule as InventoryItem.reorderLevel, run through computeStatus().
+  lowStockAt    Int          @default(0)
+  /// How the count is spoken about — "pcs", "loaf", "pack". DIRECT items only.
+  unitLabel     String       @default("pcs")
+  imageUrl      String?
+  ingredients   Json?
+  hasVariation  Boolean      @default(false)
+  variations    Json?
+  createdAt     DateTime     @default(now())
+  updatedAt     DateTime     @updatedAt
+
+  recipe RecipeItem[]
+
+  @@index([categoryId])
+}
+
+/// Recipe-less is not the same as unconfigured. RECIPE items that have no
+/// RecipeItem rows yet are a setup gap the staff screens flag; DIRECT items are
+/// finished goods that are supposed to have no recipe.
+enum StockMode {
+  RECIPE
+  DIRECT
+}
+
+enum ItemStatus {
+  AVAILABLE
+  UNAVAILABLE
+  ARCHIVED
+}
+
+/// Which prep area a category of ingredients belongs to. The client asked to
+/// see the bar and the kitchen stock separately again — this is the inventory
+/// tag, distinct from the pre-July MenuCategory.station that routed orders to
+/// prep screens.
+enum Station {
+  BAR
+  KITCHEN
+}
+
+model InventoryCategory {
+  id        String   @id @default(uuid())
+  name      String   @unique
+  /// Which prep area stocks these ingredients. KITCHEN is the default so
+  /// anything added before the tag existed keeps its current home.
+  station   Station  @default(KITCHEN)
+  /// Retiring a category hides it from the ingredient filters without deleting
+  /// it. Same nullable-timestamp pattern as InventoryItem.archivedAt. Unlike
+  /// MenuCategory this does NOT cascade to its items — recipes depend on
+  /// ingredients, so archiving those has to stay a deliberate, per-item act.
+  archivedAt DateTime?
+  createdAt DateTime @default(now())
+
+  items InventoryItem[]
+}
+
+model InventoryItem {
+  id             String            @id @default(uuid())
+  ingredientName String
+  categoryId     String
+  category       InventoryCategory @relation(fields: [categoryId], references: [id])
+  stockQuantity  Float
+  unit           String
+  /// Stock at or below this level is LOW; zero or less is OUT_OF_STOCK.
+  reorderLevel   Float             @default(0)
+  supplier       String?
+  expiryDate     DateTime?
+  status         InventoryStatus   @default(GOOD)
+  /// Retired ingredients stay on file for their purchase history but drop out of
+  /// the ingredient list and the recipe pickers. Deliberately NOT a value on
+  /// `status` — that field is recomputed from stock levels on every edit and
+  /// restock, so an ARCHIVED enum value would be wiped by the next delivery.
+  archivedAt     DateTime?
+  updatedById    String?
+  updatedBy      User?             @relation(fields: [updatedById], references: [id])
+  createdAt      DateTime          @default(now())
+  updatedAt      DateTime          @updatedAt
+
+  purchases StockPurchase[]
+  usedIn    RecipeItem[]
+  movements StockMovement[]
+
+  @@index([categoryId])
+  @@index([updatedById])
+}
+
+enum InventoryStatus {
+  GOOD
+  LOW
+  OUT_OF_STOCK
+}
+
+/// One line of a menu item's recipe: how much of an ingredient one serving eats.
+/// This is what turns the ingredient inventory into something the app can deduct
+/// from and detect shortages against.
+model RecipeItem {
+  id              String        @id @default(uuid())
+  menuItemId      String
+  menuItem        MenuItem      @relation(fields: [menuItemId], references: [id], onDelete: Cascade)
+  inventoryItemId String
+  inventoryItem   InventoryItem @relation(fields: [inventoryItemId], references: [id])
+  /// Which variation this line feeds. "" is the base recipe of an item with no
+  /// variations; items WITH variations have one set of lines per variation label
+  /// and no "" rows. Labels match the entries in MenuItem.variations JSON, so a
+  /// sale recorded for a variation deducts exactly this line set.
+  variationLabel  String        @default("")
+  /// Consumed per single serving, expressed in the ingredient's OWN unit
+  /// (Fresh Milk is stocked in ml, so 180 means 180ml). No unit conversion.
+  quantity        Float
+  createdAt       DateTime      @default(now())
+  updatedAt       DateTime      @updatedAt
+
+  @@unique([menuItemId, variationLabel, inventoryItemId])
+  @@index([inventoryItemId])
+}
+
+/// One "Add Stock" event. This is the sole source of expenses in reports.
+model StockPurchase {
+  id              String        @id @default(uuid())
+  inventoryItemId String
+  inventoryItem   InventoryItem @relation(fields: [inventoryItemId], references: [id])
+  quantity        Float
+  unitCost        Float
+  totalCost       Float
+  supplier        String?
+  purchasedById   String?
+  purchasedBy     User?         @relation(fields: [purchasedById], references: [id])
+  createdAt       DateTime      @default(now())
+
+  @@index([inventoryItemId])
+  @@index([purchasedById])
+  @@index([createdAt])
+}
+
+model Order {
+  id          String      @id @default(uuid())
+  orderNumber String      @unique
+  tableNumber String?
+  orderType   OrderType   @default(DINE_IN)
+  items       Json
+  totalAmount Float
+  status      OrderStatus @default(PENDING)
+  paidAt      DateTime?
+  createdAt   DateTime    @default(now())
+  updatedAt   DateTime    @updatedAt
+
+  transaction Transaction?
+
+  @@index([createdAt])
+}
+
+enum OrderType {
+  DINE_IN
+  TAKE_OUT
+}
+
+enum OrderStatus {
+  PENDING
+  PREPARING
+  READY
+  COMPLETED
+  CANCELLED
+}
+
+model Transaction {
+  id            String            @id @default(uuid())
+  orderId       String            @unique
+  order         Order             @relation(fields: [orderId], references: [id])
+  cashierId     String
+  cashier       User              @relation(fields: [cashierId], references: [id])
+  paymentMethod PaymentMethod
+  amount        Float
+  status        TransactionStatus @default(COMPLETED)
+  exportedAt    DateTime?
+  createdAt     DateTime          @default(now())
+
+  @@index([cashierId])
+  @@index([createdAt])
+}
+
+enum PaymentMethod {
+  CASH
+  GCASH
+  CARD
+}
+
+enum TransactionStatus {
+  COMPLETED
+  REFUNDED
+  FAILED
+}
+
+/// One end-of-day sales-import run: an Excel of products sold, uploaded to
+/// deduct ingredient stock via recipes. Purely an audit record — the deduction
+/// writes InventoryItem rows, this just logs what happened (and lets the UI warn
+/// on a likely re-upload of the same file).
+model ImportLog {
+  id           String   @id @default(uuid())
+  fileName     String
+  rowCount     Int
+  appliedCount Int
+  skippedCount Int
+  totalUnits   Int
+  /// Per-ingredient deducted summary + warnings, for the history view.
+  details      Json?
+  uploadedById String?
+  uploadedBy   User?    @relation(fields: [uploadedById], references: [id])
+  createdAt    DateTime @default(now())
+
+  @@index([uploadedById])
+  @@index([createdAt])
+}
+
+/// The stock ledger — one row per change to an ingredient's stock, whatever the
+/// cause. This is the audit trail behind Add Stock, the sales-import deduction,
+/// manual adjustments, wastage/spoilage, and expiry. Purely a record: the actual
+/// stock lives on InventoryItem.stockQuantity; each row captures before/after so
+/// history reads don't have to replay the whole chain.
+model StockMovement {
+  id              String            @id @default(uuid())
+  inventoryItemId String
+  inventoryItem   InventoryItem     @relation(fields: [inventoryItemId], references: [id])
+  type            StockMovementType
+  /// Signed change applied to stock: positive = added, negative = removed.
+  change          Float
+  before          Float
+  after           Float
+  /// Reason/note for ADJUSTMENT, WASTAGE, EXPIRY. Null for STOCK_IN / SALES_IMPORT.
+  reason          String?
+  createdById     String?
+  createdBy       User?             @relation(fields: [createdById], references: [id])
+  createdAt       DateTime          @default(now())
+
+  @@index([inventoryItemId])
+  @@index([createdAt])
+  @@index([type])
+}
+
+enum StockMovementType {
+  STOCK_IN // Stock added on an ingredient edit
+  SALES_IMPORT // Excel sales-import deduction
+  ADJUSTMENT // Manual correction (+/-)
+  WASTAGE // Spoilage / damage / discard
+  EXPIRY // Marked expired
+}
+
+/// The human-readable record of what staff did, across the whole system — the
+/// feed behind the Owner's Activity page. Deliberately separate from
+/// StockMovement: that stays the numeric stock ledger (before/after quantities),
+/// while this is the cross-cutting "who changed what" trail. Stock changes write
+/// a row to both, so the Activity feed can be searched, filtered, counted and
+/// paginated from a single table instead of merging sources at read time.
+model ActivityLog {
+  id         String         @id @default(uuid())
+  actorId    String?
+  actor      User?          @relation(fields: [actorId], references: [id])
+  /// Name and role snapshotted at write time, so the feed still reads correctly
+  /// after an account is renamed or archived.
+  actorName  String
+  actorRole  String
+  area       ActivityArea
+  action     ActivityAction
+  /// What it happened to: an ingredient, menu item, category or account name.
+  targetName String
+  targetId   String?
+  /// One-line human detail, e.g. "₱160 → ₱170" or "+15 L (Fresh Farms)".
+  detail     String?        @db.Text
+  createdAt  DateTime       @default(now())
+
+  @@index([createdAt])
+  @@index([area])
+  @@index([actorId])
+}
+
+enum ActivityArea {
+  INVENTORY // Ingredients, stock levels, inventory categories
+  MENU // Menu items and menu categories
+  USERS // Staff accounts
+  RECIPE // Recipe lines
+  IMPORT // Sales imports
+  AUTH // Sign-ins
+}
+
+enum ActivityAction {
+  CREATE
+  UPDATE
+  DELETE
+  ARCHIVE
+  RESTORE
+  STOCK_IN
+  ADJUST
+  WASTAGE
+  EXPIRY
+  IMPORT
+  LOGIN
+}
